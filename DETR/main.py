@@ -15,16 +15,16 @@ import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build_model
-
+from torch.utils.tensorboard import SummaryWriter
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_backbone', default=1e-5, type=float)
+    parser.add_argument('--lr', default=1e-6, type=float)
+    parser.add_argument('--lr_backbone', default=1e-7, type=float)
     parser.add_argument('--batch_size', default=1, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=5, type=int)
-    parser.add_argument('--lr_drop', default=200, type=int)
+    parser.add_argument('--epochs', default=160, type=int)
+    parser.add_argument('--lr_drop', default=130, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -48,7 +48,7 @@ def get_args_parser():
                         help="Intermediate size of the feedforward layers in the transformer blocks")
     parser.add_argument('--hidden_dim', default=256, type=int,
                         help="Size of the embeddings (dimension of the transformer)")
-    parser.add_argument('--dropout', default=0.1, type=float,
+    parser.add_argument('--dropout', default=0.3, type=float,
                         help="Dropout applied in the transformer")
     parser.add_argument('--nheads', default=8, type=int,
                         help="Number of attention heads inside the transformer's attentions")
@@ -80,20 +80,20 @@ def get_args_parser():
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
-    parser.add_argument('--coco_path', type=str)
+    #parser.add_argument('--coco_path', default= "Wildtrack_dataset/Image_subsets/data", type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 
-    parser.add_argument('--output_dir', default='',
+    parser.add_argument('--output_dir', default='outputs/eval/training_based_on_BB/{}'.format((round(time.time()))),
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume', default='D:/DETR/outputs/eval/backbone_training/1675308208/checkpoint.pth', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--num_workers', default=2, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -103,6 +103,19 @@ def get_args_parser():
 
 
 def main(args):
+    #creat the tensorboard folder
+    tensor_log_dir = 'outputs/log/training_based_on_BB/{}_{}'.format(('lr' + str(args.lr) + 'dropout' + str(args.dropout) + 'lr_drop' + str(args.lr_drop) + 'lr_backbone' + str(
+                args.lr_backbone) + 'start_epoch' + str(100)), (round(time.time())))
+    writer = SummaryWriter(tensor_log_dir)
+    writer.add_hparams({'lr': args.lr, 'lr_backbone': args.lr_backbone},
+                        {'lr_drop': args.lr_drop, 'dropout': args.dropout})
+    hyperparameter_log = open(tensor_log_dir + "/hyperparameter_log.txt", 'w')
+
+    hyperparameter_log.write(json.dumps(vars(args)))
+    hyperparameter_log.close()
+    metric_log = open(tensor_log_dir + "/metric_log.txt", 'a')
+    torch.cuda.empty_cache()
+
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
@@ -191,6 +204,8 @@ def main(args):
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
+        # if epoch >= 5:
+        #     optimizer.param_groups[0]['lr'] = 0
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
@@ -200,7 +215,7 @@ def main(args):
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every 100 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
+            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 10 == 0 or epoch == 1 :
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
@@ -214,6 +229,24 @@ def main(args):
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
         )
+
+        writer.add_scalar('train/train_loss', train_stats["loss"], global_step=epoch)
+        writer.add_scalar('train/train_loss_bbox', train_stats["loss_bbox"], global_step=epoch)
+        writer.add_scalar('train/train_loss_ce', train_stats['loss_ce'], global_step=epoch)
+        writer.add_scalar('train/train_loss_giou', train_stats['loss_giou'], global_step=epoch)
+        writer.add_scalar('test/test_loss', test_stats['loss'], global_step=epoch)
+        writer.add_scalar('test/test_loss_bbox', test_stats['loss_bbox'], global_step=epoch)
+        writer.add_scalar('test/test_loss_ce', test_stats['loss_ce'], global_step=epoch)
+        writer.add_scalar('test/test_loss_giou', test_stats['loss_giou'], global_step=epoch)
+        writer.add_scalar('metrics/AP', test_stats["coco_eval_bbox"][0], global_step=epoch)
+        writer.add_scalar('metrics/AP_0.50', test_stats["coco_eval_bbox"][1], global_step=epoch)
+        writer.add_scalar('metrics/AP_0.75', test_stats["coco_eval_bbox"][2], global_step=epoch)
+        writer.add_scalar('metrics/AP_medium', test_stats["coco_eval_bbox"][4], global_step=epoch)
+        writer.add_scalar('metrics/AP_large', test_stats["coco_eval_bbox"][5], global_step=epoch)
+        writer.add_scalar('metrics/AR', test_stats["coco_eval_bbox"][8], global_step=epoch)
+        writer.add_scalar('metrics/AR_medium', test_stats["coco_eval_bbox"][10], global_step=epoch)
+        writer.add_scalar('metrics/AR_Large', test_stats["coco_eval_bbox"][11], global_step=epoch)
+        writer.add_scalar('train/learning_rate', train_stats["lr"], global_step=epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
@@ -235,6 +268,10 @@ def main(args):
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)
 
+    metric_log.close()
+    writer.close()
+    writer.close()
+    writer.close()
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
